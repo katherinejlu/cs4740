@@ -11,8 +11,8 @@ for dirname, _, filenames in os.walk('/kaggle/input'):
 
 import math
 
-filepath = "DATASET/train/truthful.txt"
-
+train_path = "DATASET/train/truthful.txt"
+test_path = "DATASET/test/test.txt"
 ## capitalization? punctuation? contractions?
 
 def make_Unigram(filepath):
@@ -43,55 +43,100 @@ def make_Unigram(filepath):
     return d, word_count
 
 def make_Bigram(filepath):
-    smoothing = .3
+    smoothing = .01
     acc = 0;
-    last_word = 'grgsgtrgtsyhtsujts'
+    last_word = '<LASTWORDINITIALIZE>'
     word_count = 0
     d = collections.defaultdict(lambda:collections.defaultdict(int))
     with open(filepath) as f:
         for line in f:
             for word in line.split():
-                if last_word == 'grgsgtrgtsyhtsujts' :
+                word = word.lower()
+                word_count +=1
+                if last_word == '<LASTWORDINITIALIZE>' :
                     last_word = word
                     continue
-                word_count +=1
+                
                 d[last_word][word]+=1
                 last_word = word
-    d['<unk>']['<unk>'] = len(list(d)) * smoothing
+    d['<unk>']['<unk>'] = len(d) * smoothing
+
+
+  ### SHOULD SMOOTHING BE NUM_BIGRAMS = sum(len(bigrams) for bigrams in d.values())
+    # d['<unk>']['<unk>'] = NUM_BIGRAMS*smoothing
+    # len(d) is just number of unique tokens 
+    
     for k in d:
-        d[k]['<unk>'] = len(list(d)) * smoothing
+        d[k]['<unk>'] = len(d) * smoothing
         #print (d[k]['<unk>'])
+        acc = 0 
         for i in d[k]:
             acc+= d[k][i]
         for j in d[k]:
+
             d[k][j] = d[k][j]/acc
+
+            #print (k,j, d[k][j])
     #print (d)
     return d, word_count
 
-def perplexity1(word_count1,d):
+def perplexity(d, filepath, ngram):
     perplex = 0
-    for k in d:
-        perplex += -math.log(d[k])*d[k]*word_count1
-    print (word_count1)
-    print(perplex)
+    word_count1 = 0
+    last_word = '<LASTWORDINITIALIZE>'
+    with open(filepath) as f:
+        for line in f: 
+            for word in line.split():
+                word = word.lower()
+                word_count1 += 1
+                if ngram == 1:
+                    if word in d:
+                        perplex -= math.log(d[word])
+                    else:
+                        perplex -= math.log(d['<unk>'])
+
+                ##BIGRAM
+                else:
+                    if last_word == '<LASTWORDINITIALIZE>' :
+                        last_word = word
+                        continue
+                    if last_word in d:
+                        if word in d[last_word]:
+                            perplex += -math.log(d[last_word][word])
+                        else:
+                            perplex += -math.log(d[last_word]['<unk>'])
+                    else:
+                        perplex += -math.log(d['<unk>']['<unk>'])
+                    last_word = word
+    ## look at keys from the testing 
+##    for k in d:
+##        perplex += -math.log(d[k])*d[k]*word_count1
+                ## this is wrong bc its not total tokens, it has
+                ## it has smoothing
+                
+
     perplex = math.exp(perplex/word_count1)
+##    print(perplex) 
 
-    return perplex
+    return perplex 
+    
+##def perplexity2(word_count,d):
+##    perplex = 0
+##    for k in d:
+##        for j in d[k]:
+##            perplex += -math.log(d[k][j])
+##    print (word_count)
+##
+##    perplex = math.exp(perplex/word_count)
+##
+##    return perplex
 
-def perplexity2(word_count,d):
-    perplex = 0
-    for k in d:
-        for j in d[k]:
-            perplex += -math.log(d[k][j])
-    print (word_count)
 
-    perplex = math.exp(perplex/word_count)
-
-    return perplex
+truth_test1, word_count1 = make_Unigram(train_path)
+truth_test2, word_count2 = make_Bigram(train_path)
+p1 = perplexity(truth_test1, test_path, 1)
+p2 = perplexity(truth_test2, test_path, 2)
 
 
-truth_test1, word_count1 = make_Unigram(filepath)
-truth_test2, word_count2 = make_Bigram(filepath)
-p1 = perplexity1(word_count1,truth_test1)
-p2 = perplexity2(word_count2, truth_test2)
+
 print (p1,p2)
