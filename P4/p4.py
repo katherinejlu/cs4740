@@ -1,40 +1,296 @@
-  
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Nov 23 15:49:06 2019
-@author: Katherine
-"""
 import numpy as np
-import pandas as pd 
-import collections 
-import pickle 
-import numpy as np
+import pandas as pd
 import torch
-import torchtext.vocab 
-from torchtext.vocab import GloVe
 import torch.nn as nn
-from torch.nn import init
 import torch.optim as optim
-import math
 import random
-import os.path
+import time
+import nltk
 from torch.autograd import Variable
 from torch.nn import Embedding
-import nltk
-#import tensorflow as tf 
-import time
-from tqdm import tqdm
-from data_loader import fetch_data
-from ffnn1fix import convert_to_vector_representation, make_vocab, make_indices
-import gensim
 from gensim.scripts.glove2word2vec import glove2word2vec
 from gensim.test.utils import get_tmpfile
 from gensim.models import KeyedVectors
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-#glove = data.Field(lower = True, batch_first = True, )
-#glove.build_vocab(vectors=GloVe(name='6B', dim = 50))
+from ffnn1fix import make_vocab, make_indices
 
+# Paths
+TRAIN_PATH = 'train.csv'
+VAL_PATH   = 'dev.csv'
+TEST_PATH  = 'test.csv'
+GLOVE_PATH = 'glove.6B.100d.txt'
+
+# Hyperparameters
+HIDDEN_DIM     = 100
+NUM_EPOCHS     = 10
+MINIBATCH_SIZE = 16
+LEARNING_RATE  = 0.01
+
+# Sentiment similarity threshold: stories with sentiment shift > this
+# are marked as <different>, otherwise <similar>
+SENTIMENT_THRESHOLD = 0.5
+
+STORY_COLUMNS = [
+    'InputStoryid', 'InputSentence1', 'InputSentence2',
+    'InputSentence3', 'InputSentence4',
+    'RandomFifthSentenceQuiz1', 'RandomFifthSentenceQuiz2', 'AnswerRightEnding'
+]
+
+
+def load_glove(glove_path):
+    """
+    Convert GloVe vectors to word2vec format and load with gensim.
+    Returns the KeyedVectors model and a FloatTensor of the weight matrix.
+    """
+    tmp_file = get_tmpfile('temp_word2vec.txt')
+    glove2word2vec(glove_path, tmp_file)
+    gmodel = KeyedVectors.load_word2vec_format(tmp_file)
+    weights = torch.FloatTensor(gmodel.vectors)
+    return gmodel, weights
+
+
+def build_story_pairs(df, gmodel):
+    """
+    Build (story_text, label) pairs from a story cloze dataframe.
+    Each story has two candidate endings; the correct one is labeled 1,
+    the incorrect one is labeled 0. Both are included as training examples.
+    """
+    data = []
+    for i in range(len(df)):
+        context = ' '.join([
+            df.InputSentence1[i], df.InputSentence2[i],
+            df.InputSentence3[i], df.InputSentence4[i]
+        ])
+        quiz1 = df.RandomFifthSentenceQuiz1[i]
+        quiz2 = df.RandomFifthSentenceQuiz2[i]
+
+        if int(df.AnswerRightEnding[i]) == 1:
+            data.append((context + ' ' + quiz1, 1))
+            data.append((context + ' ' + quiz2, 0))
+        else:
+            data.append((context + ' ' + quiz2, 1))
+            data.append((context + ' ' + quiz1, 0))
+    return data
+
+
+def build_test_pairs(df):
+    """
+    Build candidate ending pairs for test stories (no labels).
+    Returns flat list alternating ending1, ending2 for each story.
+    """
+    data = []
+    for i in range(len(df)):
+        context = ' '.join([
+            df.InputSentence1[i], df.InputSentence2[i],
+            df.InputSentence3[i], df.InputSentence4[i]
+        ])
+        data.append(context + ' ' + df.RandomFifthSentenceQuiz1[i])
+        data.append(context + ' ' + df.RandomFifthSentenceQuiz2[i])
+    return data
+
+
+class RNN(nn.Module):
+    """
+    Bidirectional RNN with GloVe embeddings for binary story ending classification.
+
+    Input: a full story sentence (context + one candidate ending)
+    Features: GloVe word embeddings + POS tag embeddings + sentiment shift marker
+    Architecture: pretrained GloVe embeddings (fine-tuned) -> biRNN -> linear -> log-softmax
+
+    The sentiment shift marker (<similar> or <different>) is appended after the
+    4th sentence boundary, capturing the emotional arc of the story as a feature.
+    """
+    def __init__(self, hidden_dim, vocab_size, weights):
+        super(RNN, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.outsize = 2
+
+        # Initialize embeddings from GloVe, allow fine-tuning
+        embed = Embedding(vocab_size, hidden_dim)
+        embed.from_pretrained(weights, freeze=False)
+        self.embed = embed
+        self.weight = nn.Parameter(embed.weight)
+
+        # Bidirectional RNN: output dim is hidden_dim * 2
+        self.rnn = nn.RNN(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            nonlinearity='relu',
+            batch_first=True,
+            bidirectional=True
+        )
+        self.h0 = Variable(torch.zeros(2, 1, hidden_dim))
+        self.classifier = nn.Linear(hidden_dim * 2, self.outsize)
+        self.softmax = nn.LogSoftmax(dim=1)
+        self.loss = nn.NLLLoss()
+
+    def compute_loss(self, predicted, gold_label):
+        return self.loss(predicted, gold_label)
+
+    def forward(self, sentence, gmodel):
+        tokens = nltk.word_tokenize(sentence)
+        pos_tags = nltk.pos_tag(tokens)
+        sid = SentimentIntensityAnalyzer()
+
+        indices = []
+        sentence_count = 0
+
+        for k, token in enumerate(tokens):
+            # Handle OOV words and POS tags
+            if token not in gmodel.vocab:
+                gmodel.vocab[token] = gmodel.vocab['random']
+            pos = pos_tags[k][1]
+            if pos not in gmodel.vocab:
+                gmodel.vocab[pos] = gmodel.vocab['at']
+
+            indices.append(gmodel.vocab[token].index)
+            indices.append(gmodel.vocab[pos].index)
+
+            # Append sentiment shift marker after 4th sentence boundary
+            if token == '.':
+                sentence_count += 1
+            if sentence_count == 4:
+                sent1 = ' '.join(tokens[:k])
+                sent2 = ' '.join(tokens[k+1:])
+                shift = abs(
+                    sid.polarity_scores(sent1)['compound'] -
+                    sid.polarity_scores(sent2)['compound']
+                )
+                marker = '<similar>' if shift < SENTIMENT_THRESHOLD else '<different>'
+                if marker not in gmodel.vocab:
+                    gmodel.vocab[marker] = gmodel.vocab['the']
+                indices.append(gmodel.vocab[marker].index)
+                sentence_count += 1  # prevent re-triggering
+
+        embedded = self.embed(torch.LongTensor([indices]))
+        rnn_out, _ = self.rnn(embedded, self.h0)
+        final = rnn_out[0][-1].unsqueeze(0)
+        return self.softmax(self.classifier(final))
+
+
+def predict(model, sentences, gmodel):
+    """Run model inference on a list of sentences. Returns predictions and scores."""
+    predictions, scores = [], []
+    for sentence in sentences:
+        predicted = model(sentence, gmodel)
+        z = np.zeros(2)
+        for vec in predicted:
+            z[torch.argmax(vec).item()] += 1
+        predictions.append(torch.argmax(torch.Tensor(z)).item())
+        scores.append(torch.max(torch.Tensor(z)).item())
+    return predictions, scores
+
+
+def write_predictions(filename, predictions, scores, story_ids):
+    """
+    Write test predictions to CSV.
+    Each story has two candidate endings (even/odd index pairs).
+    If models disagree, use the predicted label directly.
+    If both agree, use the confidence score to break the tie.
+    """
+    with open(filename, 'w') as f:
+        f.write('Id,Prediction\n')
+        for i in range(len(story_ids)):
+            p1, p2 = predictions[2*i], predictions[2*i+1]
+            s1, s2 = scores[2*i], scores[2*i+1]
+
+            if p1 != p2:
+                answer = 1 if p1 == 1 else 2
+            elif p1 == 1:
+                answer = 1 if s1 > s2 else 2
+            else:
+                answer = 2 if s1 > s2 else 1
+
+            f.write(f"1,{story_ids[i]}\n" if answer == 1 else f"2,{story_ids[i]}\n")
+
+
+def main(hidden_dim=HIDDEN_DIM, number_of_epochs=NUM_EPOCHS):
+    # Load GloVe embeddings
+    gmodel, weights = load_glove(GLOVE_PATH)
+
+    # Load datasets
+    train_df = pd.read_csv(TRAIN_PATH, encoding='latin1', names=STORY_COLUMNS, skiprows=1)
+    val_df   = pd.read_csv(VAL_PATH,   encoding='latin1', names=STORY_COLUMNS, skiprows=1)
+    test_df  = pd.read_csv(TEST_PATH,  encoding='latin1', names=STORY_COLUMNS, skiprows=1)
+
+    train_data = build_story_pairs(train_df, gmodel)
+    valid_data = build_story_pairs(val_df, gmodel)
+    test_data  = build_test_pairs(test_df)
+
+    model = RNN(hidden_dim=hidden_dim, vocab_size=len(gmodel.vocab), weights=weights)
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=0.9)
+
+    for epoch in range(number_of_epochs):
+        # --- Training ---
+        model.train()
+        correct, total = 0, 0
+        start = time.time()
+
+        for batch_start in range(len(train_data) // MINIBATCH_SIZE):
+            optimizer.zero_grad()
+            loss = None
+
+            for i in range(MINIBATCH_SIZE):
+                sentence, gold_label = train_data[batch_start * MINIBATCH_SIZE + i]
+                predicted = model(sentence, gmodel)
+
+                z = np.zeros(2)
+                for vec in predicted:
+                    z[torch.argmax(vec).item()] += 1
+                predicted_label = torch.argmax(torch.Tensor(z)).item()
+
+                correct += int(predicted_label == gold_label)
+                total += 1
+
+                example_loss = model.compute_loss(predicted.view(1, -1), torch.tensor([gold_label]))
+                loss = example_loss if loss is None else loss + example_loss
+
+            (loss / MINIBATCH_SIZE).backward()
+            optimizer.step()
+
+        print(f"Epoch {epoch+1} | Train accuracy: {correct/total:.4f} | Time: {time.time()-start:.1f}s")
+
+        # --- Validation ---
+        model.eval()
+        correct, total = 0, 0
+        start = time.time()
+        random.shuffle(valid_data)
+
+        for batch_start in range(len(valid_data) // MINIBATCH_SIZE):
+            optimizer.zero_grad()
+            loss = None
+
+            for i in range(MINIBATCH_SIZE):
+                sentence, gold_label = valid_data[batch_start * MINIBATCH_SIZE + i]
+                predicted = model(sentence, gmodel)
+
+                z = np.zeros(2)
+                for vec in predicted:
+                    z[torch.argmax(vec).item()] += 1
+                predicted_label = torch.argmax(torch.Tensor(z)).item()
+
+                correct += int(predicted_label == gold_label)
+                total += 1
+
+                example_loss = model.compute_loss(predicted.view(1, -1), torch.tensor([gold_label]))
+                loss = example_loss if loss is None else loss + example_loss
+
+            (loss / MINIBATCH_SIZE).backward()
+            optimizer.step()
+
+        val_acc = correct / total
+        print(f"Epoch {epoch+1} | Val accuracy: {val_acc:.4f} | Time: {time.time()-start:.1f}s")
+
+        # --- Test predictions ---
+        predictions, scores = predict(model, test_data, gmodel)
+        filename = f"predict_epoch{epoch+1}_val{val_acc:.4f}.csv"
+        write_predictions(filename, predictions, scores, test_df.InputStoryid.tolist())
+        print(f"Predictions written to {filename}")
+
+
+if __name__ == '__main__':
+    main()
 pos_list = ["CC","CD","DT","EX","FW","IN","JJ","JJR","JJS","LS","MD","NN","NNS","NNP","NNPS","PDT","POS","PRP","PRP$","RB","RBR","RBS","RP","SYM","TO","UH","VB","VBD","VBG","VBN","VBP","VBZ","WDT","WP","WP$","WRB"]
 
 
