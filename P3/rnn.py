@@ -1,40 +1,149 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import init
 import torch.optim as optim
-import math
 import random
-import os
+import time
 from torch.autograd import Variable
 from torch.nn import Embedding
 
-
-import time
-from tqdm import tqdm
 from data_loader import fetch_data
-from ffnn1fix import convert_to_vector_representation, make_vocab, make_indices
+from ffnn1fix import make_vocab, make_indices
 
-unk = '<UNK>'
+UNK = '<UNK>'
+HIDDEN_DIM = 64
+NUM_EPOCHS = 10
+MINIBATCH_SIZE = 16
+LEARNING_RATE = 0.01
+EARLY_STOP_THRESHOLD = 0.009
 
 
 class RNN(nn.Module):
-    def __init__(self, h, input_dim): # Add relevant parameters
+    """
+    Single-layer RNN for 5-class sentiment classification on Yelp reviews.
+    Input: sequence of word indices
+    Architecture: learned embeddings -> RNN -> linear classifier -> log-softmax
+    Classification uses the final hidden state as the sequence representation.
+    """
+    def __init__(self, hidden_dim, vocab_size):
         super(RNN, self).__init__()
-        # Fill in relevant parameters
-        # Ensure parameters are initialized to small values, see PyTorch documentation for guidance
-        self.embedding = Embedding(input_dim,h)
-        self.outsize = 5 
-        self.batch = 16
-        self.h = Variable(torch.zeros(1,1,h))
-        #self.W1 = nn.Linear(input_dim,h)
-        self.W2 = nn.Linear(h,self.outsize)
-        self.activation = nn.ReLU() 
-        self.rnn = nn.RNN(input_size = h, hidden_size = h, nonlinearity = 'relu', batch_first = True )
-            
-        self.softmax = nn.LogSoftmax()
+        self.embedding = Embedding(vocab_size, hidden_dim)
+        self.rnn = nn.RNN(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            nonlinearity='relu',
+            batch_first=True
+        )
+        self.h0 = Variable(torch.zeros(1, 1, hidden_dim))
+        self.classifier = nn.Linear(hidden_dim, 5)
+        self.softmax = nn.LogSoftmax(dim=1)
         self.loss = nn.NLLLoss()
 
+    def compute_loss(self, predicted, gold_label):
+        return self.loss(predicted, gold_label)
+
+    def forward(self, sentence, word2index):
+        # Convert words to indices, using UNK for out-of-vocabulary words
+        indices = [word2index.get(word, word2index[UNK]) for word in sentence]
+        embedded = self.embedding(torch.LongTensor([indices]))
+        rnn_out, _ = self.rnn(embedded, self.h0)
+
+        # Use final hidden state as sequence representation
+        final_hidden = rnn_out[0][-1].unsqueeze(0)
+        return self.softmax(self.classifier(final_hidden))
+
+
+def train_epoch(model, optimizer, train_data, word2index, epoch):
+    model.train()
+    correct, total = 0, 0
+    start = time.time()
+    random.shuffle(train_data)
+
+    for batch_start in range(0, len(train_data) - MINIBATCH_SIZE, MINIBATCH_SIZE):
+        optimizer.zero_grad()
+        loss = None
+
+        for i in range(MINIBATCH_SIZE):
+            sentence, gold_label = train_data[batch_start + i]
+            predicted = model(sentence, word2index)
+
+            z = np.zeros(5)
+            for vec in predicted:
+                z[torch.argmax(vec).item()] += 1
+            predicted_label = torch.argmax(torch.Tensor(z)).item()
+
+            correct += int(predicted_label == gold_label)
+            total += 1
+
+            example_loss = model.compute_loss(predicted.view(1, -1), torch.tensor([gold_label]))
+            loss = example_loss if loss is None else loss + example_loss
+
+        (loss / MINIBATCH_SIZE).backward()
+        optimizer.step()
+
+    print(f"Epoch {epoch} | Train accuracy: {correct/total:.4f} | Time: {time.time()-start:.1f}s")
+
+
+def validate_epoch(model, optimizer, valid_data, word2index, epoch):
+    model.eval()
+    correct, total = 0, 0
+    start = time.time()
+
+    for batch_start in range(0, len(valid_data) - MINIBATCH_SIZE, MINIBATCH_SIZE):
+        optimizer.zero_grad()
+        loss = None
+
+        for i in range(MINIBATCH_SIZE):
+            sentence, gold_label = valid_data[batch_start + i]
+            predicted = model(sentence, word2index)
+
+            z = np.zeros(5)
+            for vec in predicted:
+                z[torch.argmax(vec).item()] += 1
+            predicted_label = torch.argmax(torch.Tensor(z)).item()
+
+            correct += int(predicted_label == gold_label)
+            total += 1
+
+            example_loss = model.compute_loss(predicted.view(1, -1), torch.tensor([gold_label]))
+            loss = example_loss if loss is None else loss + example_loss
+
+        (loss / MINIBATCH_SIZE).backward()
+        optimizer.step()
+
+    accuracy = correct / total
+    print(f"Epoch {epoch} | Val accuracy: {accuracy:.4f} | Time: {time.time()-start:.1f}s")
+    return accuracy
+
+
+def main(hidden_dim=HIDDEN_DIM, number_of_epochs=NUM_EPOCHS):
+    print(f"Training RNN | hidden_dim={hidden_dim} | lr={LEARNING_RATE}")
+
+    train_data, valid_data = fetch_data()
+    vocab = make_vocab(train_data)
+    vocab, word2index, _ = make_indices(vocab)
+
+    model = RNN(hidden_dim=hidden_dim, vocab_size=len(vocab))
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=0.9)
+
+    prev_val = 0
+    two_prev_val = 0
+
+    for epoch in range(1, number_of_epochs + 1):
+        # Early stopping: halt if validation accuracy drops consistently
+        if epoch > 2 and (prev_val - two_prev_val) <= -EARLY_STOP_THRESHOLD * 2:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+        train_epoch(model, optimizer, train_data, word2index, epoch)
+        val_acc = validate_epoch(model, optimizer, valid_data, word2index, epoch)
+
+        two_prev_val = prev_val
+        prev_val = val_acc
+
+
+if __name__ == '__main__':
+    main()
     def compute_Loss(self, predicted_vector, gold_label):
         return self.loss(predicted_vector, gold_label)    
 
