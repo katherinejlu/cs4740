@@ -1,9 +1,6 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Dec  9 17:50:23 2019
-
-@author: Katherine
-"""
+# Fine-tuning script for BERT/XLNet/RoBERTa on multiple choice tasks (SWAG, RACE, ARC).
+# Adapted from HuggingFace Transformers run_multiple_choice.py:
+# https://github.com/huggingface/transformers
 
 from __future__ import absolute_import, division, print_function
 
@@ -232,7 +229,6 @@ def evaluate(args, model, tokenizer, prefix="", test=False):
         preds = None
         out_label_ids = None
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
-            print(batch)
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
 
@@ -286,7 +282,6 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, test=False):
         cached_mode = 'dev'
     elif test:
         cached_mode = 'test'
-        print('got here1')
     else:
         cached_mode = 'train'
     assert (evaluate == True and test == True) == False
@@ -300,16 +295,13 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, test=False):
         features = torch.load(cached_features_file)
         if test: 
             examples = processor.get_test_examples(args.data_dir)
-        print('gothere2')
     else:
         logger.info("Creating features from dataset file at %s", args.data_dir)
         label_list = processor.get_labels()
         if evaluate:
             examples = processor.get_dev_examples(args.data_dir)
-            print('got val')
         elif test:
             examples = processor.get_test_examples(args.data_dir)
-            print('gothere3')
         else:
             examples = processor.get_train_examples(args.data_dir)
         logger.info("Training number: %s", str(len(examples)))
@@ -552,7 +544,6 @@ def main():
             result = evaluate(args, model, tokenizer, prefix=prefix, test=True)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
-            print('completed checkpoint')
     if best_steps:
         logger.info("best steps of eval acc is the following checkpoints: %s", best_steps)
     return results
