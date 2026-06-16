@@ -1,156 +1,160 @@
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import init
 import torch.optim as optim
-import math
 import random
-import os
-from pathlib import Path 
 import time
-from tqdm import tqdm
+
 from data_loader import fetch_data
 
-unk = '<UNK>'
-# Consult the PyTorch documentation for information on the functions used below:
-# https://pytorch.org/docs/stable/torch.html
-class FFNN(nn.Module):
-    def __init__(self, input_dim, h):
-            super(FFNN, self).__init__()
-            self.h = h
-            self.W1 = nn.Linear(input_dim, h)
-            self.activation = nn.ReLU() # The rectified linear unit; one valid choice of activation function
-            self.W2 = nn.Linear(h, 5) # bug2
-            # The below two lines are not a source for an error
-            self.softmax = nn.LogSoftmax() # The softmax function that converts vectors into probability distributions; computes log probabilities for computational benefits
-            self.loss = nn.NLLLoss() # The cross-entropy/negative log likelihood loss taught in class
+UNK = '<UNK>'
+MINIBATCH_SIZE = 16
+LEARNING_RATE = 0.01
 
-    def compute_Loss(self, predicted_vector, gold_label):
-        return self.loss(predicted_vector, gold_label)
+POS_TAGS = [
+    "CC", "CD", "DT", "EX", "FW", "IN", "JJ", "JJR", "JJS", "LS", "MD",
+    "NN", "NNS", "NNP", "NNPS", "PDT", "POS", "PRP", "PRP$", "RB", "RBR",
+    "RBS", "RP", "SYM", "TO", "UH", "VB", "VBD", "VBG", "VBN", "VBP",
+    "VBZ", "WDT", "WP", "WP$", "WRB"
+]
+
+
+class FFNN(nn.Module):
+    """
+    Feedforward Neural Network for 5-class sentiment classification.
+    Input: bag-of-words vector over vocabulary
+    Architecture: linear -> ReLU -> linear -> log-softmax
+    Trained with negative log-likelihood loss.
+    """
+    def __init__(self, input_dim, hidden_dim):
+        super(FFNN, self).__init__()
+        self.W1 = nn.Linear(input_dim, hidden_dim)
+        self.activation = nn.ReLU()
+        self.W2 = nn.Linear(hidden_dim, 5)
+        self.softmax = nn.LogSoftmax(dim=1)
+        self.loss = nn.NLLLoss()
+
+    def compute_loss(self, predicted, gold_label):
+        return self.loss(predicted, gold_label)
 
     def forward(self, input_vector):
-        # The z_i are just there to record intermediary computations for your clarity
         z1 = self.activation(self.W1(input_vector))
         z2 = self.W2(z1)
-        predicted_vector = self.softmax(z2)  #Bug1
-        return predicted_vector
+        return self.softmax(z2)
 
 
-# Returns: 
-# vocab = A set of strings corresponding to the vocabulary
 def make_vocab(data):
+    """
+    Build vocabulary from training data.
+    Includes all words in the corpus plus a fixed set of POS tags
+    and similarity markers used as additional features.
+    """
     vocab = set()
     for document, _ in data:
         for word in document:
             vocab.add(word)
-    return vocab 
+    for tag in POS_TAGS:
+        vocab.add(tag)
+    vocab.add('<similar>')
+    vocab.add('<different>')
+    return vocab
 
 
-# Returns:
-# vocab = A set of strings corresponding to the vocabulary including <UNK>
-# word2index = A dictionary mapping word/token to its index (a number in 0, ..., V - 1)
-# index2word = A dictionary inverting the mapping of word2index
 def make_indices(vocab):
-    vocab_list = sorted(vocab)
-    vocab_list.append(unk)
-    word2index = {}
-    index2word = {}
-    for index, word in enumerate(vocab_list):
-        word2index[word] = index 
-        index2word[index] = word 
-    vocab.add(unk)
-    return vocab, word2index, index2word 
+    """
+    Assign integer indices to vocabulary items.
+    Returns updated vocab (with UNK), word-to-index, and index-to-word mappings.
+    """
+    vocab_list = sorted(vocab) + [UNK]
+    word2index = {word: i for i, word in enumerate(vocab_list)}
+    index2word = {i: word for i, word in enumerate(vocab_list)}
+    vocab.add(UNK)
+    return vocab, word2index, index2word
 
 
-# Returns:
-# vectorized_data = A list of pairs (vector representation of input, y)
-def convert_to_vector_representation(data, word2index):
-    vectorized_data = []
+def vectorize(data, word2index):
+    """
+    Convert a list of (document, label) pairs into bag-of-words vectors.
+    Unknown words are mapped to the UNK index.
+    """
+    vectorized = []
     for document, y in data:
-        vector = torch.zeros(len(word2index)) 
+        vector = torch.zeros(len(word2index))
         for word in document:
-            index = word2index.get(word, word2index[unk])
+            index = word2index.get(word, word2index[UNK])
             vector[index] += 1
-        vectorized_data.append((vector, y))
-    return vectorized_data
+        vectorized.append((vector, y))
+    return vectorized
 
 
 def main(train_data, valid_data, hidden_dim, number_of_epochs):
-    print("THIS IS FFNN")
-    print("Fetching data")
-#    train_data, valid_data = fetch_data() # X_data is a list of pairs (document, y); y in {0,1,2,3,4}
+    """
+    Train and evaluate the FFNN on sentiment classification.
+    Returns a list of per-example correctness on the validation set (1=correct, 0=wrong),
+    used for cross-model comparison in main.py.
+    """
     vocab = make_vocab(train_data)
-    vocab, word2index, index2word = make_indices(vocab)
-    print("Fetched and indexed data")
-    train_data = convert_to_vector_representation(train_data, word2index)
-    valid_data = convert_to_vector_representation(valid_data, word2index)
-    print("Vectorized data")
+    vocab, word2index, _ = make_indices(vocab)
 
-    model = FFNN(input_dim = len(vocab), h = hidden_dim)
-    optimizer = optim.SGD(model.parameters(),lr=0.01, momentum=0.9)
-    print("Training for {} epochs".format(number_of_epochs))
+    train_data = vectorize(train_data, word2index)
+    valid_data = vectorize(valid_data, word2index)
+
+    model = FFNN(input_dim=len(vocab), hidden_dim=hidden_dim)
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=0.9)
+
     for epoch in range(number_of_epochs):
+        # --- Training ---
         model.train()
-        optimizer.zero_grad()
-        loss = None
-        correct = 0
-        total = 0
-        start_time = time.time()
-        print("Training started for epoch {}".format(epoch + 1))
-#        random.shuffle(train_data) # Good practice to shuffle order of training data
-        minibatch_size = 16 
-        N = len(train_data) 
-        #adjusted for small round of testing; put back to N // minibatch_size for regular 
-        for minibatch_index in range(min(128,N // minibatch_size)):
+        correct, total = 0, 0
+        start = time.time()
+        N = len(train_data)
+
+        for batch_start in range(min(128, N // MINIBATCH_SIZE)):
             optimizer.zero_grad()
             loss = None
-            for example_index in range(minibatch_size):
-                input_vector, gold_label = train_data[minibatch_index * minibatch_size + example_index]
-                predicted_vector = model(input_vector)  
-                predicted_label = torch.argmax(predicted_vector)
+
+            for i in range(MINIBATCH_SIZE):
+                input_vector, gold_label = train_data[batch_start * MINIBATCH_SIZE + i]
+                predicted = model(input_vector)
+                predicted_label = torch.argmax(predicted)
+
                 correct += int(predicted_label == gold_label)
                 total += 1
-                example_loss = model.compute_Loss(predicted_vector.view(1,-1), torch.tensor([gold_label]))
-                if loss is None:
-                    loss = example_loss
-                else:
-                    loss += example_loss
-            loss = loss / minibatch_size
-            loss.backward()
+
+                example_loss = model.compute_loss(predicted.view(1, -1), torch.tensor([gold_label]))
+                loss = example_loss if loss is None else loss + example_loss
+
+            (loss / MINIBATCH_SIZE).backward()
             optimizer.step()
-        print("Training completed for epoch {}".format(epoch + 1))
-        print("Training accuracy for epoch {}: {}".format(epoch + 1, correct / total))
-        print("Training time for this epoch: {}".format(time.time() - start_time))
-        model.eval() #bug3
-        loss = None
-        correct = 0
-        total = 0
-        start_time = time.time()
-        print("Validation started for epoch {}".format(epoch + 1))
-#        random.shuffle(valid_data) # Good practice to shuffle order of validation data
-        minibatch_size = 16 
-        N = len(valid_data) 
-        out = []
-        for minibatch_index in range(min(128,N // minibatch_size)):
+
+        print(f"Epoch {epoch+1} | Train accuracy: {correct/total:.4f} | Time: {time.time()-start:.1f}s")
+
+        # --- Validation ---
+        model.eval()
+        correct, total = 0, 0
+        start = time.time()
+        N = len(valid_data)
+        results = []
+
+        for batch_start in range(min(128, N // MINIBATCH_SIZE)):
             optimizer.zero_grad()
             loss = None
-            for example_index in range(minibatch_size):
-                input_vector, gold_label = valid_data[minibatch_index * minibatch_size + example_index]
-                predicted_vector = model(input_vector)
-                predicted_label = torch.argmax(predicted_vector)
-                correct += int(predicted_label == gold_label)
-                out.append(int(predicted_label == gold_label))
+
+            for i in range(MINIBATCH_SIZE):
+                input_vector, gold_label = valid_data[batch_start * MINIBATCH_SIZE + i]
+                predicted = model(input_vector)
+                predicted_label = torch.argmax(predicted)
+                is_correct = int(predicted_label == gold_label)
+
+                correct += is_correct
                 total += 1
-                example_loss = model.compute_Loss(predicted_vector.view(1,-1), torch.tensor([gold_label]))
-                if loss is None:
-                    loss = example_loss
-                else:
-                    loss += example_loss
-            loss = loss / minibatch_size 
-            loss.backward()
+                results.append(is_correct)
+
+                example_loss = model.compute_loss(predicted.view(1, -1), torch.tensor([gold_label]))
+                loss = example_loss if loss is None else loss + example_loss
+
+            (loss / MINIBATCH_SIZE).backward()
             optimizer.step()
-            
-        print("Validation completed for epoch {}".format(epoch + 1))
-        print("Validation accuracy for epoch {}: {}".format(epoch + 1, correct / total))
-        print("Validation time for this epoch: {}".format(time.time() - start_time))
-        return out
+
+        print(f"Epoch {epoch+1} | Val accuracy: {correct/total:.4f} | Time: {time.time()-start:.1f}s")
+
+    return results
