@@ -1,40 +1,140 @@
-#import numpy as np # linear algebra
-#import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 import collections
-# Input data files are available in the "../input/" directory.
-# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
-
-import os
-
-for dirname, _, filenames in os.walk('/kaggle/input'):
-    for filename in filenames:
-        print(os.path.join(dirname, filename))
-
 import math
-import numpy
 
-train_Tpath = "DATASET/train/truthful.txt"
-train_Dpath = "DATASET/train/deceptive.txt"
+TRAIN_T = "DATASET/train/truthful.txt"
+TRAIN_D = "DATASET/train/deceptive.txt"
+TEST     = "DATASET/test/test.txt"
+VAL_T   = "DATASET/validation/truthful.txt"
+VAL_D   = "DATASET/validation/deceptive.txt"
 
-test_path = "DATASET/test/test.txt"
 
-val_Tpath = "DATASET/validation/truthful.txt"
-val_Dpath = "DATASET/validation/deceptive.txt"
-
-## capitalization? punctuation? contractions?
-
-def make_Unigram(filepath):
-    word_count = 0
+def make_unigram(filepath):
+    """
+    Build a smoothed unigram language model from a corpus file.
+    Uses Laplace-style smoothing with an <unk> token for unseen words.
+    Returns a dict of word probabilities and the total token count.
+    """
     smoothing = 0.5
-    count = 0
     d = collections.defaultdict(int)
-    d['<unk>'] = 0
+    word_count = 0
+
     with open(filepath) as f:
         for line in f:
             for word in line.split():
+                d[word] += 1
                 word_count += 1
-                d[word]+=1
 
+    d['<unk>'] = smoothing * len(d)
+    word_count += d['<unk>']
+
+    for k in d:
+        d[k] = (d[k] + 0.6) / (word_count + 0.6 * len(d))
+
+    return d, word_count
+
+
+def make_bigram(filepath):
+    """
+    Build a smoothed bigram language model from a corpus file.
+    Uses add-1 smoothing with per-word <unk> backoff.
+    Bigram counts reset at the start of each line (review boundary).
+    Returns a nested dict of bigram probabilities and the total token count.
+    """
+    smoothing = 1
+    word_count = 0
+    d = collections.defaultdict(lambda: collections.defaultdict(int))
+
+    with open(filepath) as f:
+        for line in f:
+            last_word = '<START>'
+            for word in line.split():
+                word_count += 1
+                if last_word == '<START>':
+                    last_word = word
+                    continue
+                d[last_word][word] += 1
+                last_word = word
+
+    num_bigrams = sum(len(bigrams) for bigrams in d.values())
+    d['<unk>']['<unk>'] = num_bigrams * smoothing
+
+    for k in d:
+        d[k]['<unk>'] = len(d[k]) * smoothing
+        acc = sum(d[k][i] + 1 for i in d[k])
+        for j in d[k]:
+            d[k][j] = (d[k][j] + 1) / acc
+
+    return d, word_count
+
+
+def perplexity(d, filepath, ngram):
+    """
+    Compute per-review perplexity of a language model on a corpus file.
+    Returns a list of perplexity scores, one per line (review).
+    Unseen words and bigrams are handled via <unk> backoff.
+    """
+    plist = []
+
+    with open(filepath) as f:
+        for line in f:
+            perplex = 0
+            word_count = 0
+            last_word = '<START>'
+
+            for word in line.split():
+                word_count += 1
+
+                if ngram == 1:
+                    prob = d[word] if word in d else d['<unk>']
+                    perplex -= math.log(prob)
+                else:
+                    if last_word == '<START>':
+                        last_word = word
+                        continue
+                    if last_word in d:
+                        prob = d[last_word][word] if word in d[last_word] else d[last_word]['<unk>']
+                    else:
+                        prob = d['<unk>']['<unk>']
+                    perplex -= math.log(prob)
+                    last_word = word
+
+            plist.append(math.exp(perplex / word_count))
+
+    return plist
+
+
+# --- Train language models ---
+deceptive_unigram, _ = make_unigram(TRAIN_D)
+truthful_unigram, _  = make_unigram(TRAIN_T)
+deceptive_bigram, _  = make_bigram(TRAIN_D)
+truthful_bigram, _   = make_bigram(TRAIN_T)
+
+# --- Validation: unigram ---
+print("Unigram validation perplexity (model on matching class):")
+print(sum(perplexity(deceptive_unigram, VAL_D, 1)) / len(perplexity(deceptive_unigram, VAL_D, 1)),
+      sum(perplexity(truthful_unigram,  VAL_T, 1)) / len(perplexity(truthful_unigram,  VAL_T, 1)))
+
+# --- Validation: bigram ---
+Dp = perplexity(deceptive_bigram, VAL_D, 2)
+Tp = perplexity(truthful_bigram,  VAL_T, 2)
+Dp_cross = perplexity(deceptive_bigram, VAL_T, 2)
+Tp_cross = perplexity(truthful_bigram,  VAL_D, 2)
+
+print("Bigram validation perplexity (model on matching class):")
+print(sum(Dp) / len(Dp), sum(Tp) / len(Tp))
+print("Bigram validation perplexity (model on opposite class):")
+print(sum(Dp_cross) / len(Dp_cross), sum(Tp_cross) / len(Tp_cross))
+
+# --- Test predictions ---
+Dp_test = perplexity(deceptive_bigram, TEST, 2)
+Tp_test = perplexity(truthful_bigram,  TEST, 2)
+
+with open('test.csv', 'w') as f:
+    f.write('Id,Prediction\n')
+    for i in range(len(Dp_test)):
+        # Classify as deceptive (0) if deceptive model assigns lower perplexity
+        label = 0 if Dp_test[i] < Tp_test[i] else 1
+        f.write(f"{i},{label}\n")
     d['<unk>'] = smoothing*len(d)
     word_count += d['<unk>']
 
