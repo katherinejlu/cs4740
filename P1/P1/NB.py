@@ -1,40 +1,83 @@
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.naive_bayes import BernoulliNB, ComplementNB, MultinomialNB
-import numpy as np
+import collections
 import math
+import numpy as np
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.naive_bayes import MultinomialNB
 
-train_path = "train.txt"
-test_path = "test/test.txt"
-val_Tpath = "validation/truthful.txt"
-val_Dpath = "validation/deceptive.txt"
-tval = open(val_Tpath)
-dval = open (val_Dpath)
-test = open (test_path)
-corpus = open(train_path)
+TRAIN_T = "DATASET/train/truthful.txt"
+TRAIN_D = "DATASET/train/deceptive.txt"
+TEST    = "DATASET/test/test.txt"
+VAL_T   = "DATASET/validation/truthful.txt"
+VAL_D   = "DATASET/validation/deceptive.txt"
 
-t = np.zeros(512)
-d = np.ones(512)
-y = np.concatenate((d,t),axis = 0)
 
-## capitalization? punctuation? contractions?
+def add_features(matrix):
+    """
+    Appends two engineered features to a document-term matrix:
+    - Total word count (review length)
+    - Unique word count (lexical diversity)
+    Both features are motivated by the observation that deceptive reviews
+    may differ systematically in length and vocabulary richness.
+    """
+    length = np.sum(matrix, axis=1, keepdims=True)
+    unique = np.count_nonzero(matrix, axis=1, keepdims=True)
+    return np.concatenate((matrix, length, unique), axis=1)
 
-vec = CountVectorizer(ngram_range =(1,2))
-vector = vec.fit_transform(corpus).toarray()
 
-print (vector.shape[0],vector.shape[1])
+def load_corpus(truthful_path, deceptive_path):
+    """
+    Loads truthful and deceptive training corpora.
+    Returns the combined file handle and binary labels
+    (deceptive=1, truthful=0).
+    """
+    with open(truthful_path) as t, open(deceptive_path) as d:
+        truthful_lines = t.readlines()
+        deceptive_lines = d.readlines()
 
-'''add len of reviews feature '''
-new = np.sum(vector,axis = 1)
-new = np.expand_dims(new, axis=0)
-vector = np.concatenate((vector,new.T),axis = 1)
+    lines = deceptive_lines + truthful_lines
+    labels = np.array([1] * len(deceptive_lines) + [0] * len(truthful_lines))
+    return lines, labels
 
-''' add unique words feature '''
-uniq = np.count_nonzero(vector,axis = 1)
-uniq = np.expand_dims(uniq, axis=0)
-vector = np.concatenate((vector,uniq.T),axis = 1)
 
-print (vector.shape[0],vector.shape[1])
-model = MultinomialNB().fit(vector,y)
+# --- Load and vectorize training data ---
+train_lines, y = load_corpus(TRAIN_T, TRAIN_D)
+vec = CountVectorizer(ngram_range=(1, 2))
+X_train = add_features(vec.fit_transform(train_lines).toarray())
+
+print(f"Training matrix shape: {X_train.shape}")
+
+# --- Train classifier ---
+model = MultinomialNB()
+model.fit(X_train, y)
+
+# --- Validation ---
+def evaluate(filepath, label_name):
+    with open(filepath) as f:
+        X = add_features(vec.transform(f).toarray())
+    preds = model.predict(X)
+    # deceptive=1, truthful=0; correct predictions are 1s for deceptive, 0s for truthful
+    if label_name == 'deceptive':
+        acc = np.sum(preds) / len(preds)
+    else:
+        acc = 1 - np.sum(preds) / len(preds)
+    print(f"{label_name} accuracy: {acc:.3f}")
+    return preds
+
+preds_d = evaluate(VAL_D, 'deceptive')
+preds_t = evaluate(VAL_T, 'truthful')
+overall = (np.sum(preds_d) + (len(preds_t) - np.sum(preds_t))) / (len(preds_d) + len(preds_t))
+print(f"Overall validation accuracy: {overall:.3f}")
+
+# --- Test predictions ---
+with open(TEST) as f:
+    X_test = add_features(vec.transform(f).toarray())
+
+preds_test = model.predict(X_test)
+
+with open('testNB.csv', 'w') as f:
+    f.write('Id,Prediction\n')
+    for i, pred in enumerate(preds_test):
+        f.write(f"{i},{pred}\n")model = MultinomialNB().fit(vector,y)
 
 ## truthful val
 t_val_ = vec.transform(tval).toarray()
