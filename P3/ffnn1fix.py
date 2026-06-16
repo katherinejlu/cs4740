@@ -6,6 +6,9 @@ import time
 
 from data_loader import fetch_data
 
+# Original buggy implementation provided by course staff (CS 4740, Project 3).
+# See ffnn1fix.py for the debugged version with bugs identified and corrected.
+
 UNK = '<UNK>'
 MINIBATCH_SIZE = 16
 LEARNING_RATE = 0.01
